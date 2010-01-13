@@ -1,0 +1,234 @@
+#!/usr/bin/php -q
+<?php
+/*
+cc_app.agi
+Copyright (C) 2007 Eric Tamme
+A pre-paid calling card application for Asterisk
+that supports partitions, agents, and resale.
+*/
+
+
+set_time_limit(30);	           /* Set maximum run time limit */
+require('phpagi.php');	       /* Require the phpAGI class */
+require('cc_app_func.php');    /* Functions for dialcode matching, setting channel vars */
+require('cc_app_config.php');  /* General configuration */
+require('rate.php');         /* class for encapsulating a rate */
+
+$agi = new AGI();	/* Create a new phpAGI object */
+$agi->answer();		/* ALWAYS answer the call */
+
+$agi->verbose("Created AGI object");
+
+
+mysql_connect($dbhost,$dbuser,$dbpass);	/* Connect to MySQL */
+mysql_select_db($db);	/* Select the actual database */
+
+$agi->verbose("Connected to DB");
+
+$acc_ok=0;		/* Set the flag for "account ok" */
+do			/* Loop */
+{
+  $short=false;
+  /* check for caller id */
+  $cidarray = $agi->parse_callerid();
+  $cid      = trim($cidarray["username"]);
+
+  $agi->verbose("callerid info - got $cid");
+  foreach($cidarray as $k => $v)
+   $agi->verbose("$k - $v");
+  
+  /* if caller id is set, lookup the account */
+  if($cid!="")
+  {
+    $account_id=lookup_cid($cid);
+  }
+  else
+    $account_id=-1;
+
+  /* if account was not found it returns -1 */
+  if($account_id==-1)
+  {
+    /* Get input from the user, max 10 digits, time out after 10 seconds */
+    $arr=$agi->get_data("ccapp/$lang/enter-account-number",10000,10);
+
+    $account_id=$arr["result"];	/* Digits are always stored in 'result' */
+    if($account_id<10)	/* If the account id is less than 10 digits, it's invalid */
+    {
+      $short=true;	/* Set the short flag */
+      $agi->stream_file("ccapp/$lang/invalid-account");
+    }
+  }
+
+  if(!$short)	/* if length of account id is good, validate the entry */
+  {
+    $cust_pref = get_features($account_id);
+    $agi->verbose("$cust_pref");
+ 
+    /*invalid acc*/
+    if($cust_pref==0)
+    {
+      $rep_entry_pref=0;
+      $agi->stream_file("ccapp/$lang/invalid-account");
+      $agi->stream_file("ccapp/$lang/you-entered");
+      $agi->say_digits($account_id);    /* Say each digit they entered */
+      $acc_ok=0;
+    }  
+    else /* load preferences */
+    {
+      $agi->verbose("Looking up product for account_id $account_id");
+      $product_id=get_product($account_id);
+      $agi->verbose("Got product $product_id");
+      $rep_entry_pref=$cust_pref["rep_entry_pref"];
+      $lang=$cust_pref["language_pref"];
+      $agi->exec("SET LANGUAGE()=$lang");
+ 
+    } 
+
+    if($rep_entry_pref)
+    {
+      $agi->stream_file("ccapp/$lang/you-entered");
+      $agi->say_digits($account_id);	/* Say each digit they entered */
+      $arr=$agi->get_data("ccapp/$lang/to-continue");	/* Get input */
+      $acc_ok=$arr["result"];		/* Set the data and continue to loop check */
+    }
+    else
+    {
+       if($cust_pref!=0)
+         $acc_ok=1;
+    }
+  }
+}while($acc_ok!=1);	/* Keep looping until "account is ok" */
+
+$auth=false;	/* Set authorized flag */
+do		/* Loop */
+{
+ $short=false;	/* set short entry flag */
+ $arr=$agi->get_data("ccapp/$lang/please-enter-pin",10000,20);/* Get input */
+ $pass=$arr["result"];
+ if($pass<1000)/* Check if the password is less than 4 digits */
+ {
+   $agi->stream_file("ccapp/$lang/invalid-pin");/* Pin is too short */
+   $short=true;/* Set short flag */
+ }
+
+ if(!$short)	/* If pin length is ok */
+ {
+   /* Authorize against database */
+   $res=mysql_query("SELECT * from customer WHERE account_id='$account_id' AND password=PASSWORD('$pass')");
+   if(mysql_num_rows($res)>0)	/* 1 or more rows returned means they have authorized */
+   { 
+     $auth=true;	/* Set authorized flag */
+     $row=mysql_fetch_array($res);/* Get customer info */
+     $credit=$row["credit"];
+     $carr=explode(".",$credit);/* Get dollars and cents */
+
+     $agi->stream_file("ccapp/$lang/remaining-balance");
+     $agi->say_number($carr[0]);
+     $agi->stream_file("ccapp/$lang/dollars");
+     if($carr[1]>0)	/* only say cents if there are any */
+     {
+       $cents=$carr[1]/100;
+       $agi->stream_file("ccapp/$lang/and");
+       $agi->say_number($cents);
+       $agi->stream_file("ccapp/$lang/cents");
+     }
+   }
+   else
+   $agi->stream_file("ccapp/$lang/invalid-pin");/* Not authorized, try again */
+}
+}while($auth==false);/* Check authorization and loop if not */
+
+/* enter the dialing loop */
+$dial_ok=false; /* set the dial ok flag */
+do
+{
+ $arr=$agi->get_data("ccapp/$lang/enter-number-int",10000,20);
+ $pattern=$arr["result"];
+
+ /* Check for speed dial */
+ if(substr($pattern,0,1)=="*")
+ {
+   $agi->verbose("got speed dial entry $pattern");
+   $sdn=substr($pattern,1,1);
+   $array_opt="speed_dial_$sdn";
+   $agi->verbose("looking up $array_opt");
+   $speed_dial=$cust_pref[$array_opt]; /* speed_dial_x where x is the number they entered eg, *1 x=1 */
+   $agi->verbose("Found $speed_dial");
+   if($speed_dial=="")
+     $pattern="xxx"; /* just make sure it doesnt randomly match a code */
+   else
+     $pattern=$speed_dial;
+    
+ }
+
+ /* check to see that they entered something, then match the pattern */
+ if($pattern!="")
+ {
+ 
+  $agi->verbose("Attempting  new rate($pattern,$product_id);");
+  /* setup the rate */
+  try{
+    $prod_rate = new rate($pattern,$product_id);
+    $rate_info= $prod_rate->get_rate_info();
+    $agi->verbose("$rate_info");
+    $dial_ok=true;
+  }
+  catch(Exception $e){
+    $agi->verbose("OMFG EXPLOSION!");
+    $obj_err = $e->getMessage();
+    $agi->verbose("ERROR: $obj_err");
+    $dial_ok=false;
+    $agi->stream_file("ccapp/$lang/unrecognized-number");
+  }
+
+  $agi->verbose("Trying to grab rate info");
+  $min_cost    = $prod_rate->get_minimum_cost();
+  $rate        = $prod_rate->get_sell_rate();
+  $connect_fee = $prod_rate->get_connect_fee();
+  $inc         = $prod_rate->get_billing_increment();
+  $peer        = $prod_rate->get_peer();
+  $proto       = $prod_rate->get_protocol();
+  $min         = $prod_rate->get_minimum_duration();
+
+  $agi->verbose("GOT: $min_cost :  $rate  :  $connect_fee  :  $increment");
+  
+  /* determine approximately how much talk time they have */
+  $agi->verbose("Determining talk time");
+
+  /* use the get_ms function to do the estimated time calculation */
+  $ms=get_ms($agi,$credit,$prod_rate);
+
+  $agi->verbose("got $ms milleseconds");
+ 
+  $agi->verbose("Checking available credit: Min: $min_cost Credit: $credit");
+  /* announce info to caller */
+  if($min_cost>=$credit)
+  {
+   $agi->stream_file("ccapp/$lang/not-enough-credit");
+   $dial_ok=false;
+  }
+  else
+  {
+     $dial_ok=true;
+     
+     /* convert milleseconds to seconds for announcement */
+     $total=$ms/1000;
+     
+     $minutes=floor($total/60);/* calculate minutes */
+     $seconds=$total%60;       /* calculate seconds */
+     $agi->stream_file("ccapp/$lang/call-term-approx");
+     $agi->say_number("$minutes");
+     $agi->stream_file("ccapp/$lang/minutes-and");
+     $agi->say_number("$seconds");
+     $agi->stream_file("ccapp/$lang/seconds");
+     $tms=$total*1000;
+     set_vars($agi,$ms,$account_id,$pattern,$rate,$min,$inc,$connect_fee,$peer,$proto);
+     $agi->exec("GOTO $dcontext|$dextension|$dpriority");
+   
+   }
+ }
+ else
+  $agi->stream_file("ccapp/$lang/unrecognized-number");//matching rate dialcode
+} while(!$dial_ok);
+
+?>  

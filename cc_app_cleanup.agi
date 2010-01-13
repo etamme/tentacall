@@ -1,0 +1,116 @@
+#!/usr/bin/php -q
+<?php
+/*
+cc_cleanup.agi
+Copyright (C) 2007 Eric Tamme
+
+The cleanup half of the cc_app.agi calling card script.
+A core functionality pre-paid calling card application for Asterisk.
+
+This script takes passed variables like call duration, rate, accid and updates account
+credit availabilty after a call.
+*/
+
+set_time_limit(30);            /* Set maximum run time limut */
+require('phpagi.php');         /* Require the phpAGI class */
+require('cc_app_config.php');  /* General configuration */
+
+$agi = new AGI();       /* Create a new phpAGI object */
+
+mysql_connect($dbhost,$dbuser,$dbpass); /* Connect to MySQL */
+mysql_select_db($db);   /* Select the actual database */
+
+$accidr=$agi->get_variable("ACCID");
+$patternr=$agi->get_variable("PATTERN");
+$rater=$agi->get_variable("RATE");
+$durationr=$agi->get_variable("ANSWEREDTIME");
+$incr=$agi->get_variable("INC");
+$minr=$agi->get_variable("MIN");
+$cdater=$agi->get_variable("CDATE");
+$connect_feer=$agi->get_variable("CONNECTFEE");
+$peerr=$agi->get_variable("PEER");
+$timer=$agi->get_variable("TIME");
+
+$accid=$accidr["data"];
+$pattern=$patternr["data"];
+$rate=$rater["data"];
+$duration=$durationr["data"];
+$inc=$incr["data"];
+$min=$minr["data"];
+$cdate=$cdater["data"];
+$connect_fee=$connect_feer["data"];
+$peer=$peerr["data"];
+$time=$timer["data"];
+
+$agi->verbose("$cdate, $accid, $pattern, $rate, $duration, $inc, $min, $connect_fee, $peer, $time");
+
+
+if($duration!="") //if there was no answer, dont bill
+{
+   //Call is complete, now do the clean up work and calculations
+   //get total call duration (note this is for backup purposes, since it is not the ACTUAL call duration)   
+
+     //roundup by increment
+     if($duration%$inc!=0)
+       $duration=($duration+($duration%$inc));
+     //check for minimum duration
+     if($duration<$min)    
+       $duration=$min;
+
+     $agi->verbose("Duration is now: $duration");
+
+     //calculate actual call cost
+     $cost=round(($duration/60)*$rate,4);
+     
+     $agi->verbose("Cost is: $cost");
+     
+     //insert a cdr
+     $query="INSERT INTO cdr (calldate,accountid,dialcode,rate,duration,cost,connect_fee,peer) VALUES ('$cdate','$accid','$pattern','$rate','$duration','$cost','$connect_fee','$peer')";
+     $agi->verbose("$query");
+     if(mysql_query($query))
+     {
+       $cdr_id=mysql_insert_id();
+       $agi->verbose("Success inserting cdr account $accid");
+     }
+     else
+     {
+       $err=mysql_error();
+       $agi->verbose("$err");
+     }
+
+   if($cost!=0)
+   {
+     $agi->verbose("cost: $cost\nconnect fee: $connect_fee");
+     $tcost=$cost+$connect_fee;
+     $agi->verbose("total cost: $tcost");
+      
+     if(mysql_query("INSERT INTO transaction (customer_id,cdr_id,date,amount,type) VALUES ('$accid','$cdr_id',NOW(),'$tcost','debit')"))
+        $agi->verbose("Success inserting transaction");
+     else
+     {
+       $err=mysql_error();
+       $agi->verbose("$err");
+     }
+
+     if(mysql_query("UPDATE customer SET credit=((credit-$cost)-$connect_fee) WHERE account_id='$accid'"))
+       $agi->verbose("Success updating account $accid credit");
+     else
+     {
+       $err=mysql_error();
+       $agi->verbose("$err");
+     }
+  }
+}
+else
+{
+  //the call didnt complete, but still write a cdr for historical purposes
+  $agi->verbose("Call incomplete, inserting a historical cdr (not billing)");
+  if(mysql_query("INSERT INTO cdr (calldate,accountid,dialcode,rate,duration,cost,connect_fee,peer) VALUES ('$cdate','$accid','$pattern','$rate','$duration','$cost','$connect_fee','$peer')"))
+    $agi->verbose("Success inserting cdr account $accid");
+  else
+  {
+    $err=mysql_error();
+    $agi->verbose("$err");
+  }
+}
+?>
