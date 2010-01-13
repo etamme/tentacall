@@ -1,7 +1,0 @@
-Tentacall (c) 2007 Eric Tamme
-A pre-paid calling card application for Asterisk
-that supports partitions, agents, multi language announcement support, and resale.
-
-I wrote this when the company I was working for was looking for a calling card platform.  Several FOSS apps existed, but they were not geared for resale, agents etc. that are usually involved in carrier level systems.  The commercial stuff that was available cost a fortune, and I figured I could write some thing that would fit most our needs.  Tentacall is the result.  
-
-This was up and running on an Asterisk 1.2 system.  I recently rediscovered this sourcecode.  I dont have a database dump, but there is a development history, and image of the db relationship diagram available at http://dev.etamme.com/wiki/index.php/Asterisk_calling_card
